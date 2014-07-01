@@ -156,11 +156,12 @@ class ControlFlowGraph(AstFullTraverser):
         block = self.new_block()
         self.use_block(block)
         node.initial_block = block
+        self.exit_block = self.new_block()
+        # Special case
+        self.exit_block.start_line_no = "Exit"
         for z in node.body:
             self.visit(z)
-        exit_block = self.new_block()
-        exit_block.start_line_no = "Exit"
-        self.check_child_exits(self.current_block, exit_block)
+        self.check_child_exits(self.current_block, self.exit_block)
             
     def do_If(self, node):
         ''' If an if statement is the last in a straight line then an empty
@@ -243,8 +244,10 @@ class ControlFlowGraph(AstFullTraverser):
     def do_Return(self, node):
         ''' End the current block here.
             No statements in this block after this are valid. '''
-        self.visit(node.value)
+        if node.value:
+            self.visit(node.value)
         self.current_block.statements.append(node)
+        self.current_block.exit_blocks.append(self.exit_block)
         self.current_block.has_return = True
         
     def do_Assign(self, node):
@@ -293,6 +296,20 @@ class ControlFlowGraph(AstFullTraverser):
         else:
             self.error("'break' outside loop", node)
         self.current_block.has_return = True
+        
+    def do_Yield(self, node):
+        ''' Here we deal with the control flow when the iterator goes through
+            the function.
+            We don't set has_return to true since, in theory, it can either
+            exit or continue from here.
+            TODO: Stop exit appearing twice in the exit_blocks for the last
+            statement in the function. Possible solution is to use a set
+            instead of a list. '''
+        self.current_block.statements.append(node)
+        self.current_block.exit_blocks.append(self.exit_block)
+        next_block = self.new_block()
+        self.current_block.exit_blocks.append(next_block)
+        self.use_next_block(next_block)
         
     def do_TryExcept(self, node):
         exc = self.new_block()
