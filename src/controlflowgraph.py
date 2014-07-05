@@ -25,7 +25,7 @@ class Block():
         self.start_line_no = 0
         self.statements = []
         self.exit_blocks = []
-        # Use to indicate whether the block has been visited
+        # Use to indicate whether the block has been visited. Used for printing
         self.marked = False
         # Used to describe special blocks
         self.tag = Block.NORMAL
@@ -47,8 +47,7 @@ class Block():
 F_BLOCK_LOOP = 0
 F_BLOCK_EXCEPT = 1
 F_BLOCK_FINALLY = 2
-F_BLOCK_FINALLY_END = 3
-        
+
 class ControlFlowGraph(AstFullTraverser):
     
     def __init__(self):
@@ -104,7 +103,20 @@ class ControlFlowGraph(AstFullTraverser):
             # variables. They are now the same instance.
             candidate_block.copy_dict(after_control_block)
             return
-        candidate_block.exit_blocks.append(after_control_block)
+        # This is needed to avoid two "Exits" appearing for the return or yield
+        # at the end of a function.
+        if not after_control_block in candidate_block.exit_blocks:
+            candidate_block.exit_blocks.append(after_control_block)
+            
+    def add_to_block(self, node):
+        for f_block_type, f_block in reversed(self.frame_blocks):
+            if f_block_type == F_BLOCK_EXCEPT:
+                self.current_block.statements.append(node)
+                for handler in f_block:
+                    self.current_block.exit_blocks.append(handler)
+                self.use_next_block()
+        else:
+            self.current_block.statements.append(node)
     
     def run(self, root):
         self.visit(root)
@@ -161,7 +173,16 @@ class ControlFlowGraph(AstFullTraverser):
         self.exit_block.start_line_no = "Exit"
         for z in node.body:
             self.visit(z)
-        self.check_child_exits(self.current_block, self.exit_block)
+        # Here there's a chance that the last block already points the exit.
+        # Such as yields and returns
+        print(self.current_block.start_line_no)
+        for e in self.current_block.exit_blocks:
+            print(e.start_line_no)
+            if e.start_line_no == "Exit":
+                return
+        else:
+            print("hi")
+            self.check_child_exits(self.current_block, self.exit_block)
             
     def do_If(self, node):
         ''' If an if statement is the last in a straight line then an empty
@@ -243,11 +264,19 @@ class ControlFlowGraph(AstFullTraverser):
         
     def do_Return(self, node):
         ''' End the current block here.
-            No statements in this block after this are valid. '''
+            No statements in this block after this are valid.
+            In a try, returns go to the finally block. '''
         if node.value:
             self.visit(node.value)
         self.current_block.statements.append(node)
-        self.current_block.exit_blocks.append(self.exit_block)
+        # Check if the block is an try-finally.
+        for f_block_type, f_block in reversed(self.frame_blocks):
+            if f_block_type == F_BLOCK_FINALLY:
+                return_exit = f_block
+                break
+        else:
+            return_exit = self.exit_block
+        self.current_block.exit_blocks.append(return_exit)
         self.current_block.has_return = True
         
     def do_Assign(self, node):
@@ -256,7 +285,8 @@ class ControlFlowGraph(AstFullTraverser):
         self.current_block.statements.append(node)
         
     def do_Continue(self, node):
-        ''' Continues can not be in a finally block. '''
+        ''' Continues can not be in a finally block.
+            TODO: Fix this up.  '''
         self.current_block.append(node)
         if not self.frame_blocks:
             self.error("'continue' not properly in loop", node)
@@ -301,52 +331,68 @@ class ControlFlowGraph(AstFullTraverser):
         ''' Here we deal with the control flow when the iterator goes through
             the function.
             We don't set has_return to true since, in theory, it can either
-            exit or continue from here.
-            TODO: Stop exit appearing twice in the exit_blocks for the last
-            statement in the function. Possible solution is to use a set
-            instead of a list. '''
+            exit or continue from here. '''
         self.current_block.statements.append(node)
         self.current_block.exit_blocks.append(self.exit_block)
         next_block = self.new_block()
         self.current_block.exit_blocks.append(next_block)
         self.use_next_block(next_block)
         
-    def do_TryExcept(self, node):
-        exc = self.new_block()
-        otherwise = self.new_block()
-        after_te = self.new_block()
-        body = self.use_next_block()
-        self.push_frame_block(F_BLOCK_EXCEPT, body)
-        for z in node.body:
-            self.visit(z)
-        self.pop_frame_block(F_BLOCK_EXCEPT, body)
-        self.use_next_block(exc)
+    def do_Try(self, node):
+        ''' It is a great ordeal to find out which statements can cause which
+            exceptions. Assume every statement can cause any exception. So
+            each statement has its own block and a link to each exception.
+            
+            orelse executed if an exception is not raised therefore last try
+            statement should point to the else.
+            
+            nested try-finallys go to each other during a return '''
+        after_try_block = self.new_block()
+        final_block = None
+        orelse_block = None
+        
+        exception_handlers = []
         for handler in node.handlers:
             assert isinstance(handler, ast.ExceptHandler)
-            cleanup_body = self.use_next_block()
-            self.push_frame_block(F_BLOCK_FINALLY, cleanup_body)
-            self.visit_sequence(handler.body)
-            self.pop_frame_block(F_BLOCK_FINALLY, cleanup_body)
-            # New except block 
-            self.use_next_block()
-        self.use_next_block(otherwise)
-        for z in node.orelse:
-            self.visit(z)
-        self.use_next_block(after_te)
+            initial_handler_block = self.new_block()
+            self.use_block(initial_handler_block)
+            for z in handler.body:
+                self.visit(z)
+            handler_exit = final_block if node.finalbody else after_try_block
+            self.check_child_exits(self.current_block, handler_exit)
+            exception_handlers.append(initial_handler_block)            
         
-    def do_TryFinally(self, node):
-        ''' Finally must always be executed '''
-        end = self.new_block()
-        body = self.use_next_block()
-        self.push_frame_block(F_BLOCK_FINALLY, body)
+        f_blocks = []
+        if node.finalbody:
+            f_blocks.append((F_BLOCK_FINALLY, final_block))
+        if node.handlers:
+            f_blocks.append((F_BLOCK_EXCEPT, exception_handlers))
+        for f in f_blocks:
+            self.push_frame_block(f[0], f[1])
         for z in node.body:
             self.visit(z)
-        self.pop_frame_block(F_BLOCK_FINALLY, body)
-        self.use_next_block(end)
-        self.push_frame_block(F_BLOCK_FINALLY_END, end)
-        for z in node.finalbody:
-            self.visit(z)
-        self.pop_frame_block(F_BLOCK_FINALLY_END, end)
+        for f in reversed(f_blocks):
+            self.pop_frame_block(f[0], f[1])
+        
+        if node.finalbody:
+            # Either end of orelse or try should point to finally body
+            final_block = self.new_block()
+            for z in node.finalbody:
+                self.visit(z)
+            self.check_child_exits(self.current_block, after_try_block)
+        
+        if node.orelse:
+            orelse_block = self.new_block()
+            # Last block in body can always go to the orelse
+            self.check_child_exits(self.current_block, orelse_block)
+            for z in node.orelse:
+                self.visit(z)
+            orelse_exit = final_block if node.finalbody else after_try_block
+            self.check_child_exits(self.current_block, orelse_exit)
+        else:
+            self.check_child_exits(self.current_block, after_try_block)
+            
+        self.use_next_block(after_try_block)     
         
     def do_Pass(self, node):
         self.current_block.statements.append(node)
