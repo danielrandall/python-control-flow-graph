@@ -47,6 +47,7 @@ class Block():
 F_BLOCK_LOOP = 0
 F_BLOCK_EXCEPT = 1
 F_BLOCK_FINALLY = 2
+F_BLOCK_FINALLY_END = 3
 
 class ControlFlowGraph(AstFullTraverser):
     
@@ -54,6 +55,7 @@ class ControlFlowGraph(AstFullTraverser):
         self.current_block = None
         # Used to hold how control flow is nested (e.g. if inside of a for)
         self.frame_blocks = []
+        self.current_line_num = 0
         
     def parse_ast(self, source_ast):
         self.run(source_ast)
@@ -109,12 +111,33 @@ class ControlFlowGraph(AstFullTraverser):
             candidate_block.exit_blocks.append(after_control_block)
             
     def add_to_block(self, node):
+        ''' We want every try statement to be in its own block. '''
+        if not self.current_block:
+            return
+        # We only want the 'top level' statements
+        if self.current_line_num >= node.lineno:
+            return   
+        # Special cases - test must be in its own block
+        if isinstance(node, ast.While) or isinstance(node, ast.For):
+            if not self.is_empty_block(self.current_block):
+                test_block = self.new_block()
+                self.current_block.exit_blocks.append(test_block)
+                self.use_next_block(test_block)
+        self.current_line_num = node.lineno
         for f_block_type, f_block in reversed(self.frame_blocks):
             if f_block_type == F_BLOCK_EXCEPT:
+                # Statement is in a try - set exits to next statement and
+                # excepts
                 self.current_block.statements.append(node)
                 for handler in f_block:
                     self.current_block.exit_blocks.append(handler)
-                self.use_next_block()
+                # Special case
+                if isinstance(node, ast.While) or isinstance(node, ast.For):
+                    break
+                next_statement_block = self.new_block()
+                self.current_block.exit_blocks.append(next_statement_block)
+                self.use_next_block(next_statement_block)
+                break
         else:
             self.current_block.statements.append(node)
     
@@ -146,11 +169,11 @@ class ControlFlowGraph(AstFullTraverser):
         
     def visit(self, node):
         '''Visit a single node. Callers are responsible for visiting children.'''
-        self.check_block_num(node)
         if self.check_has_return():
             return
+        self.add_to_block(node)
+        self.check_block_num(node)
         method = getattr(self, 'do_' + node.__class__.__name__)
-        print(method)
         return method(node)
 
     def check_block_num(self, node):
@@ -160,6 +183,7 @@ class ControlFlowGraph(AstFullTraverser):
             return
         if not self.current_block.start_line_no:
             self.current_block.start_line_no = node.lineno
+            print(self.current_block.start_line_no )
             
     def check_has_return(self):
         return self.current_block and self.current_block.has_return
@@ -175,19 +199,15 @@ class ControlFlowGraph(AstFullTraverser):
             self.visit(z)
         # Here there's a chance that the last block already points the exit.
         # Such as yields and returns
-        print(self.current_block.start_line_no)
         for e in self.current_block.exit_blocks:
-            print(e.start_line_no)
             if e.start_line_no == "Exit":
                 return
         else:
-            print("hi")
             self.check_child_exits(self.current_block, self.exit_block)
             
     def do_If(self, node):
         ''' If an if statement is the last in a straight line then an empty
             and unused block will be created as the after_if. '''
-        self.current_block.statements.append(node)
         if_block = self.current_block
         after_if_block = self.new_block()
         # Then block
@@ -229,14 +249,8 @@ class ControlFlowGraph(AstFullTraverser):
             The next block of the test could in theory be the else or after.
             But when we access it for the breaks we want it to be the after. '''
         # Put the test in its own block
-        if self.empty_block(self.current_block):
-            test_block = self.current_block
-        else:
-            test_block = self.new_block()
-            self.current_block.exit_blocks.append(test_block)
-            self.use_next_block(test_block)
-            test_block.statements.append(node)
-            test_block.start_line_no = node.lineno
+        test_block = self.current_block
+            
         test_block.tag = Block.LOOP_HEADER
         self.push_frame_block(F_BLOCK_LOOP, test_block)
 
@@ -268,7 +282,6 @@ class ControlFlowGraph(AstFullTraverser):
             In a try, returns go to the finally block. '''
         if node.value:
             self.visit(node.value)
-        self.current_block.statements.append(node)
         # Check if the block is an try-finally.
         for f_block_type, f_block in reversed(self.frame_blocks):
             if f_block_type == F_BLOCK_FINALLY:
@@ -279,15 +292,9 @@ class ControlFlowGraph(AstFullTraverser):
         self.current_block.exit_blocks.append(return_exit)
         self.current_block.has_return = True
         
-    def do_Assign(self, node):
-        if self.current_block.has_return:
-            return
-        self.current_block.statements.append(node)
-        
     def do_Continue(self, node):
         ''' Continues can not be in a finally block.
             TODO: Fix this up.  '''
-        self.current_block.append(node)
         if not self.frame_blocks:
             self.error("'continue' not properly in loop", node)
         current_block, block = self.frame_blocks[-1]
@@ -319,9 +326,6 @@ class ControlFlowGraph(AstFullTraverser):
         for f_block_type, f_block in reversed(self.frame_blocks):
             if f_block_type == F_BLOCK_LOOP:
                 self.current_block.exit_blocks.append(f_block.next)
-                print(self.current_block.start_line_no)
-                print(f_block.next.start_line_no)
-                self.current_block.statements.append(node)
                 break
         else:
             self.error("'break' outside loop", node)
@@ -332,7 +336,6 @@ class ControlFlowGraph(AstFullTraverser):
             the function.
             We don't set has_return to true since, in theory, it can either
             exit or continue from here. '''
-        self.current_block.statements.append(node)
         self.current_block.exit_blocks.append(self.exit_block)
         next_block = self.new_block()
         self.current_block.exit_blocks.append(next_block)
@@ -349,8 +352,23 @@ class ControlFlowGraph(AstFullTraverser):
             nested try-finallys go to each other during a return '''
         after_try_block = self.new_block()
         final_block = None
-        orelse_block = None
+        try_body_block = self.new_block()
+        self.current_block.next_block = try_body_block
+        orelse_block = self.new_block()
         
+        before_line_no = self.current_line_num
+        if node.finalbody:
+            # Either end of orelse or try should point to finally body
+            final_block = self.new_block()
+            self.use_block(final_block)
+            self.push_frame_block(F_BLOCK_FINALLY_END, node)
+            for z in node.finalbody:
+                self.visit(z)
+            self.pop_frame_block(F_BLOCK_FINALLY_END, node)
+            self.check_child_exits(self.current_block, after_try_block)
+        self.current_line_num = before_line_no
+        
+        before_line_no = self.current_line_num
         exception_handlers = []
         for handler in node.handlers:
             assert isinstance(handler, ast.ExceptHandler)
@@ -360,7 +378,8 @@ class ControlFlowGraph(AstFullTraverser):
                 self.visit(z)
             handler_exit = final_block if node.finalbody else after_try_block
             self.check_child_exits(self.current_block, handler_exit)
-            exception_handlers.append(initial_handler_block)            
+            exception_handlers.append(initial_handler_block)   
+        self.current_line_num = before_line_no         
         
         f_blocks = []
         if node.finalbody:
@@ -369,22 +388,17 @@ class ControlFlowGraph(AstFullTraverser):
             f_blocks.append((F_BLOCK_EXCEPT, exception_handlers))
         for f in f_blocks:
             self.push_frame_block(f[0], f[1])
+        self.use_block(try_body_block)
         for z in node.body:
             self.visit(z)
         for f in reversed(f_blocks):
             self.pop_frame_block(f[0], f[1])
         
-        if node.finalbody:
-            # Either end of orelse or try should point to finally body
-            final_block = self.new_block()
-            for z in node.finalbody:
-                self.visit(z)
-            self.check_child_exits(self.current_block, after_try_block)
-        
         if node.orelse:
             orelse_block = self.new_block()
             # Last block in body can always go to the orelse
             self.check_child_exits(self.current_block, orelse_block)
+            self.use_block(orelse_block)
             for z in node.orelse:
                 self.visit(z)
             orelse_exit = final_block if node.finalbody else after_try_block
@@ -394,9 +408,6 @@ class ControlFlowGraph(AstFullTraverser):
             
         self.use_next_block(after_try_block)     
         
-    def do_Pass(self, node):
-        self.current_block.statements.append(node)
-            
 class PrintCFG(AstFullTraverser):
     
     def __init__(self, cfg):
