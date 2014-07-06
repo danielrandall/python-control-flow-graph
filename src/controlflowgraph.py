@@ -171,8 +171,8 @@ class ControlFlowGraph(AstFullTraverser):
         '''Visit a single node. Callers are responsible for visiting children.'''
         if self.check_has_return():
             return
-        self.add_to_block(node)
         self.check_block_num(node)
+        self.add_to_block(node)
         method = getattr(self, 'do_' + node.__class__.__name__)
         return method(node)
 
@@ -274,6 +274,7 @@ class ControlFlowGraph(AstFullTraverser):
             self.check_child_exits(self.current_block, after_loop_block)
         else:
             self.add_to_exits(test_block, after_loop_block)
+        
         self.use_next_block(after_loop_block)
         
     def do_Return(self, node):
@@ -349,7 +350,8 @@ class ControlFlowGraph(AstFullTraverser):
             orelse executed if an exception is not raised therefore last try
             statement should point to the else.
             
-            nested try-finallys go to each other during a return '''
+            nested try-finallys go to each other during a return 
+            TODO'''
         after_try_block = self.new_block()
         final_block = None
         try_body_block = self.new_block()
